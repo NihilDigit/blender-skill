@@ -1,0 +1,373 @@
+#!/usr/bin/env python3
+"""blendr — headless Blender wrapper for AI agents and humans.
+
+A thin, dependency-free CLI around `blender -b` that:
+  * runs user Python scripts inside Blender with helper libraries on sys.path
+  * auto-saves `.blend` and renders a preview PNG after each run
+  * organises outputs into versioned `iter_NNN_<slug>/` folders
+  * prunes old iterations and reports disk usage
+
+Usage:
+  blendr run <script.py> [--name NAME] [--preview MODE] [-- script-args...]
+  blendr render <script.py|.blend>
+  blendr sheet  <script.py>
+  blendr turntable <script.py>
+  blendr inspect <.blend>
+  blendr open <iter-id|.blend>
+  blendr promote <iter-id> <project-name>
+  blendr prune [--keep N]
+  blendr du
+  blendr templates
+  blendr new <template> [--name NAME]
+  blendr doctor
+
+Env:
+  BLENDER_BIN         override blender executable (default: `blender` in PATH)
+  BLENDER_WORK_DIR    output root (default: ~/blender-work)
+  BLENDR_KEEP         iterations to keep when pruning (default: 50)
+"""
+import argparse
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+from datetime import datetime
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+LIB_DIR = ROOT / "lib"
+TEMPLATES_DIR = ROOT / "templates"
+
+WORK_DIR = Path(os.environ.get("BLENDER_WORK_DIR", str(Path.home() / "blender-work"))).expanduser()
+ITERS_DIR = WORK_DIR / "iters"
+PROJECTS_DIR = WORK_DIR / "projects"
+RENDERS_DIR = WORK_DIR / "renders"
+ASSETS_DIR = WORK_DIR / "assets"
+CACHE_DIR = WORK_DIR / "cache"
+KEEP = int(os.environ.get("BLENDR_KEEP", "50"))
+
+BLENDER = os.environ.get("BLENDER_BIN") or shutil.which("blender") or "blender"
+
+
+# ---------------------------------------------------------------- utils
+
+def _ensure_dirs():
+    for d in (ITERS_DIR, PROJECTS_DIR, RENDERS_DIR, ASSETS_DIR, CACHE_DIR):
+        d.mkdir(parents=True, exist_ok=True)
+
+
+def _slug(text):
+    s = re.sub(r"[^\w\-]+", "-", text.lower()).strip("-")
+    return s[:40] or "scene"
+
+
+def _next_iter_id():
+    _ensure_dirs()
+    nums = []
+    for p in ITERS_DIR.iterdir():
+        m = re.match(r"iter_(\d+)_", p.name)
+        if m:
+            nums.append(int(m.group(1)))
+    return (max(nums) + 1) if nums else 1
+
+
+def _make_iter_dir(name=None):
+    n = _next_iter_id()
+    slug = _slug(name) if name else datetime.now().strftime("%H%M%S")
+    d = ITERS_DIR / f"iter_{n:04d}_{slug}"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _resolve_iter(iter_id):
+    """Accept '42', 'iter_0042_foo', or full path."""
+    p = Path(iter_id)
+    if p.exists():
+        return p
+    if iter_id.isdigit():
+        n = int(iter_id)
+        candidates = list(ITERS_DIR.glob(f"iter_{n:04d}_*"))
+        if candidates:
+            return candidates[0]
+    if (ITERS_DIR / iter_id).exists():
+        return ITERS_DIR / iter_id
+    raise SystemExit(f"blendr: no iteration matching {iter_id!r}")
+
+
+def _build_blender_cmd(user_script, env_extra, extra_args=()):
+    env = os.environ.copy()
+    env["BLENDR_LIB_DIR"] = str(LIB_DIR)
+    env.update(env_extra)
+    cmd = [
+        BLENDER, "-b", "--factory-startup",
+        "--python", str(LIB_DIR / "blendr_prelude.py"),
+        "--python", str(user_script),
+        "--python", str(LIB_DIR / "blendr_finalize.py"),
+        "--python-exit-code", "1",
+    ]
+    if extra_args:
+        cmd.append("--")
+        cmd.extend(extra_args)
+    return cmd, env
+
+
+# ---------------------------------------------------------------- run
+
+def cmd_run(args):
+    script = Path(args.script).resolve()
+    if not script.exists():
+        raise SystemExit(f"blendr: script not found: {script}")
+
+    name = args.name or script.stem
+    out_dir = _make_iter_dir(name)
+    shutil.copy2(script, out_dir / "script.py")
+
+    env_extra = {
+        "BLENDR_OUT_DIR": str(out_dir),
+        "BLENDR_OUT_BLEND": str(out_dir / "scene.blend"),
+        "BLENDR_OUT_PNG": str(out_dir / "preview.png"),
+        "BLENDR_PREVIEW": args.preview,
+        "BLENDR_SAMPLES": str(args.samples),
+        "BLENDR_RES": args.res,
+    }
+    cmd, env = _build_blender_cmd(script, env_extra, args.script_args)
+    t0 = time.time()
+    rc = subprocess.call(cmd, env=env)
+    dt = time.time() - t0
+    print(f"\nblendr: {out_dir}  (exit {rc}, {dt:.1f}s)")
+    if rc == 0:
+        _maybe_prune()
+    return rc
+
+
+def cmd_render(args):
+    """Same as run, but forces preview=auto regardless of script behavior."""
+    args.preview = "auto"
+    return cmd_run(args)
+
+
+def cmd_sheet(args):
+    args.preview = "sheet"
+    return cmd_run(args)
+
+
+def cmd_turntable(args):
+    args.preview = "turntable"
+    return cmd_run(args)
+
+
+# ---------------------------------------------------------------- inspect
+
+def cmd_inspect(args):
+    blend = Path(args.blend).resolve()
+    if not blend.exists():
+        raise SystemExit(f"blendr: not found: {blend}")
+    inspect_script = """
+import bpy, sys
+print("=== blendr inspect ===")
+print(f"file: {bpy.data.filepath}")
+print(f"engine: {bpy.context.scene.render.engine}")
+print(f"resolution: {bpy.context.scene.render.resolution_x}x{bpy.context.scene.render.resolution_y}")
+print(f"frame range: {bpy.context.scene.frame_start}-{bpy.context.scene.frame_end}")
+print(f"camera: {bpy.context.scene.camera.name if bpy.context.scene.camera else 'NONE'}")
+print(f"objects ({len(bpy.context.scene.objects)}):")
+by_type = {}
+total_polys = 0
+for o in bpy.context.scene.objects:
+    by_type[o.type] = by_type.get(o.type, 0) + 1
+    if o.type == 'MESH':
+        total_polys += len(o.data.polygons)
+for t, c in sorted(by_type.items()):
+    print(f"  {t}: {c}")
+print(f"total polys: {total_polys}")
+print(f"materials: {len(bpy.data.materials)}")
+"""
+    cmd = [BLENDER, "-b", str(blend),
+           "--python-expr", inspect_script,
+           "--python-exit-code", "1"]
+    return subprocess.call(cmd)
+
+
+# ---------------------------------------------------------------- iter mgmt
+
+def cmd_open(args):
+    p = Path(args.target)
+    if not p.exists() or p.is_dir():
+        d = _resolve_iter(args.target)
+        blend = d / "scene.blend"
+    else:
+        blend = p
+    if not blend.exists():
+        raise SystemExit(f"blendr: no .blend at {blend}")
+    print(f"blendr: opening {blend}")
+    return subprocess.call([BLENDER, str(blend)])
+
+
+def cmd_promote(args):
+    src = _resolve_iter(args.iter_id)
+    dst = PROJECTS_DIR / args.project_name
+    if dst.exists():
+        raise SystemExit(f"blendr: project already exists: {dst}")
+    PROJECTS_DIR.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(src, dst)
+    print(f"blendr: promoted {src.name} → {dst}")
+    return 0
+
+
+def _maybe_prune():
+    iters = sorted(ITERS_DIR.glob("iter_*"), key=lambda p: p.stat().st_mtime)
+    if len(iters) > KEEP:
+        excess = iters[: len(iters) - KEEP]
+        for p in excess:
+            try:
+                subprocess.call(["trash-put", str(p)])
+            except FileNotFoundError:
+                shutil.rmtree(p)
+        print(f"blendr: pruned {len(excess)} old iterations (kept {KEEP})")
+
+
+def cmd_prune(args):
+    iters = sorted(ITERS_DIR.glob("iter_*"), key=lambda p: p.stat().st_mtime)
+    keep = args.keep
+    if len(iters) <= keep:
+        print(f"blendr: nothing to prune ({len(iters)} ≤ keep={keep})")
+        return 0
+    excess = iters[: len(iters) - keep]
+    for p in excess:
+        try:
+            subprocess.call(["trash-put", str(p)])
+        except FileNotFoundError:
+            shutil.rmtree(p)
+    print(f"blendr: pruned {len(excess)} (kept {keep})")
+    return 0
+
+
+def cmd_du(args):
+    _ensure_dirs()
+    total = 0
+    for d in (ITERS_DIR, PROJECTS_DIR, RENDERS_DIR, ASSETS_DIR, CACHE_DIR):
+        size = sum(p.stat().st_size for p in d.rglob("*") if p.is_file())
+        total += size
+        n = sum(1 for _ in d.iterdir())
+        print(f"  {d.name:10}  {_human(size):>10}  ({n} entries)")
+    print(f"  {'total':10}  {_human(total):>10}")
+    return 0
+
+
+def _human(n):
+    for unit in ("B", "K", "M", "G", "T"):
+        if n < 1024:
+            return f"{n:.1f}{unit}"
+        n /= 1024
+    return f"{n:.1f}P"
+
+
+# ---------------------------------------------------------------- templates
+
+def cmd_templates(args):
+    if not TEMPLATES_DIR.exists():
+        print("blendr: no templates dir")
+        return 1
+    for p in sorted(TEMPLATES_DIR.glob("*.py")):
+        first = p.read_text().splitlines()[:3]
+        doc = next((l.strip().strip('"').strip("'") for l in first
+                    if l.strip().startswith(('"""', "'''", "#"))), "")
+        print(f"  {p.stem:25}  {doc}")
+    return 0
+
+
+def cmd_new(args):
+    src = TEMPLATES_DIR / f"{args.template}.py"
+    if not src.exists():
+        raise SystemExit(f"blendr: no template {args.template!r}. Try `blendr templates`.")
+    name = args.name or args.template
+    out_dir = _make_iter_dir(name)
+    dst = out_dir / "script.py"
+    shutil.copy2(src, dst)
+    print(f"blendr: created {dst}")
+    print(f"  edit it, then: blendr run {dst}")
+    return 0
+
+
+# ---------------------------------------------------------------- doctor
+
+def cmd_doctor(args):
+    print(f"blender:        {BLENDER}")
+    rc = subprocess.call([BLENDER, "--version"], stdout=subprocess.PIPE)
+    if rc != 0:
+        print("  ✗ blender not runnable")
+        return 1
+    print(f"work dir:       {WORK_DIR}")
+    print(f"  iters:        {ITERS_DIR} ({len(list(ITERS_DIR.glob('iter_*'))) if ITERS_DIR.exists() else 0} iterations)")
+    print(f"  projects:     {PROJECTS_DIR}")
+    print(f"  renders:      {RENDERS_DIR}")
+    print(f"lib dir:        {LIB_DIR}")
+    print(f"templates:      {TEMPLATES_DIR} ({len(list(TEMPLATES_DIR.glob('*.py')))} templates)")
+    print(f"keep threshold: {KEEP}")
+    print(f"trash-put:      {'yes' if shutil.which('trash-put') else 'no (will use rm on prune)'}")
+    return 0
+
+
+# ---------------------------------------------------------------- main
+
+def main():
+    p = argparse.ArgumentParser(prog="blendr", description=__doc__.split("\n\n")[0])
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    def add_run_args(sp):
+        sp.add_argument("script", help="Python script to run inside Blender")
+        sp.add_argument("--name", help="iteration slug (default: script stem)")
+        sp.add_argument("--samples", type=int, default=16, help="CYCLES samples (default 16)")
+        sp.add_argument("--res", default="512x512", help="preview resolution WxH (default 512x512)")
+        sp.add_argument("script_args", nargs=argparse.REMAINDER,
+                        help="args passed to the script after `--`")
+
+    sp = sub.add_parser("run", help="run script + auto preview")
+    add_run_args(sp); sp.add_argument("--preview", default="auto",
+                                      choices=("auto", "skip", "sheet", "turntable"))
+    sp.set_defaults(func=cmd_run)
+
+    sp = sub.add_parser("render", help="run script and force a preview render")
+    add_run_args(sp); sp.set_defaults(func=cmd_render)
+
+    sp = sub.add_parser("sheet", help="run script + 2x2 contact sheet")
+    add_run_args(sp); sp.set_defaults(func=cmd_sheet)
+
+    sp = sub.add_parser("turntable", help="run script + 16-frame turntable")
+    add_run_args(sp); sp.set_defaults(func=cmd_turntable)
+
+    sp = sub.add_parser("inspect", help="print scene summary of a .blend")
+    sp.add_argument("blend"); sp.set_defaults(func=cmd_inspect)
+
+    sp = sub.add_parser("open", help="open iter or .blend in Blender GUI")
+    sp.add_argument("target"); sp.set_defaults(func=cmd_open)
+
+    sp = sub.add_parser("promote", help="copy iter to projects/<name>")
+    sp.add_argument("iter_id"); sp.add_argument("project_name")
+    sp.set_defaults(func=cmd_promote)
+
+    sp = sub.add_parser("prune", help="trash old iterations")
+    sp.add_argument("--keep", type=int, default=KEEP)
+    sp.set_defaults(func=cmd_prune)
+
+    sp = sub.add_parser("du", help="show disk usage")
+    sp.set_defaults(func=cmd_du)
+
+    sp = sub.add_parser("templates", help="list templates")
+    sp.set_defaults(func=cmd_templates)
+
+    sp = sub.add_parser("new", help="copy template to a new iter")
+    sp.add_argument("template"); sp.add_argument("--name")
+    sp.set_defaults(func=cmd_new)
+
+    sp = sub.add_parser("doctor", help="health check")
+    sp.set_defaults(func=cmd_doctor)
+
+    args = p.parse_args()
+    sys.exit(args.func(args) or 0)
+
+
+if __name__ == "__main__":
+    main()

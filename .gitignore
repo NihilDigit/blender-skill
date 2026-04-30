@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# Editor / OS
+.DS_Store
+*.swp
+.idea/
+.vscode/
+
+# Blender
+*.blend1
+*.blend2
+*.blend@
+
+# Local outputs from running templates inside the repo
+/iters/
+/output/
+/test_output/
+
+# Local notes
+NOTES.local.md
+TODO.local.md

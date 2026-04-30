@@ -132,6 +132,8 @@ def cmd_run(args):
         "BLENDR_SAMPLES": str(args.samples),
         "BLENDR_RES": args.res,
     }
+    if args.device is not None:
+        env_extra["BLENDR_DEVICE"] = args.device.upper()
     cmd, env = _build_blender_cmd(script, env_extra, args.script_args)
     t0 = time.time()
     rc = subprocess.call(cmd, env=env)
@@ -321,8 +323,9 @@ def main():
         sp.add_argument("--name", help="iteration slug (default: script stem)")
         sp.add_argument("--samples", type=int, default=16, help="CYCLES samples (default 16)")
         sp.add_argument("--res", default="512x512", help="preview resolution WxH (default 512x512)")
-        sp.add_argument("script_args", nargs=argparse.REMAINDER,
-                        help="args passed to the script after `--`")
+        sp.add_argument("--device", default=None,
+                        help="render device: AUTO|CPU|OPTIX|CUDA|HIP|METAL|ONEAPI "
+                             "(default: BLENDR_DEVICE env var, else CPU)")
 
     sp = sub.add_parser("run", help="run script + auto preview")
     add_run_args(sp); sp.add_argument("--preview", default="auto",
@@ -365,7 +368,17 @@ def main():
     sp = sub.add_parser("doctor", help="health check")
     sp.set_defaults(func=cmd_doctor)
 
-    args = p.parse_args()
+    # Split argv on `--` so `--samples` etc. work in any position relative
+    # to <script>. Everything after the first `--` is forwarded to the user
+    # script via Blender's `--` (extra_args).
+    raw = sys.argv[1:]
+    if "--" in raw:
+        idx = raw.index("--")
+        pre, post = raw[:idx], raw[idx + 1:]
+    else:
+        pre, post = raw, []
+    args = p.parse_args(pre)
+    args.script_args = post
     sys.exit(args.func(args) or 0)
 
 

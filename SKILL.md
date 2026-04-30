@@ -80,9 +80,17 @@ bpy.context.scene.collection.objects.link(obj)
 
 ### Render engine
 
-The runtime forces **CYCLES + CPU** for previews because EEVEE and Workbench require an OpenGL context, which is unreliable in pure-headless environments. CYCLES at 16 samples 512² is fast (~1s) and produces real lighting / shadows / reflections.
+The runtime forces **CYCLES** for previews because EEVEE and Workbench require an OpenGL context, which is unreliable in pure-headless environments. Cycles at 16 samples 512² on CPU is fast (~1s) and produces real lighting / shadows / reflections.
 
-If you want a final beauty render, set `BLENDR_SAMPLES=512 BLENDR_RES=1920x1080` for that run, or pass `--samples 512 --res 1920x1080`.
+**Device selection** — pass `--device CPU|OPTIX|CUDA|HIP|METAL|ONEAPI|AUTO` (or set `BLENDR_DEVICE`):
+
+- **CPU** (default) — works on any machine, fastest for the default 16-sample 512² preview because GPU kernel JIT + BVH upload (~1s on RTX-class) doesn't amortize at that scale.
+- **OPTIX / CUDA / HIP / METAL / ONEAPI** — force a specific GPU backend. Falls back to CPU with a `[blendr] WARN` if no matching device is found.
+- **AUTO** — picks GPU when the render is heavy (`samples ≥ 64` OR `pixels > 512²`), CPU otherwise. Probes backends in order: OPTIX, CUDA, HIP, METAL, ONEAPI. Use this for "do the right thing" workflows.
+
+Empirical speedup on a heavy render (RTX 4060 Mobile, 1920×1080, 512 spp, 8 meshes with materials): CPU 94s → OPTIX 14s (~6.8×). For light previews (16 spp 512²) CPU is ~1s vs OPTIX ~1.5s — keep CPU for HITL iteration.
+
+For a final beauty render: `blendr run --device AUTO --samples 512 --res 1920x1080 script.py`.
 
 ## CLI reference
 
@@ -101,11 +109,12 @@ blendr new <template>          copy template to a fresh iter
 blendr doctor                  health check
 ```
 
-Common flags:
+Common flags (work in any position relative to `<script.py>`):
 - `--name <slug>` — name the iter directory
 - `--samples N` — override CYCLES samples (default 16)
 - `--res WxH` — override preview resolution (default 512x512)
-- `-- args...` — pass extra args to the user script via `sys.argv`
+- `--device <BACKEND>` — `CPU` (default) | `OPTIX` | `CUDA` | `HIP` | `METAL` | `ONEAPI` | `AUTO`
+- `-- args...` — everything after a literal `--` is forwarded to the user script via `sys.argv`
 
 ## Environment variables
 
@@ -114,6 +123,7 @@ Common flags:
 | `BLENDER_BIN` | `which blender` | Path to blender executable |
 | `BLENDER_WORK_DIR` | `~/blender-work` | Where iters/projects/renders live |
 | `BLENDR_KEEP` | `50` | Iter count threshold before auto-prune |
+| `BLENDR_DEVICE` | `CPU` | Render device — same values as `--device` |
 
 ## Workflow patterns
 
@@ -156,9 +166,10 @@ For complex models, escalate to `blendr sheet` (4 angles) to verify geometry fro
 
 - **Operators silently fail in -b mode** when they need viewport context. Use `bpy.data.*` constructors.
 - **`bh.empty_scene()` resets render engine to EEVEE** (it's `bpy.ops.wm.read_factory_settings(use_empty=True)` under the hood). The runtime forces it back to CYCLES before previewing, but if the user script does its own render, they need to set engine themselves.
-- **CYCLES on CPU is slow at high samples**. For previews, keep samples at 16–64. For final renders, expect minutes per frame at 512+ samples.
+- **CYCLES on CPU is slow at high samples**. For previews, keep samples at 16–64. For final renders pass `--device AUTO` (or a specific GPU backend) so heavy renders go to GPU automatically.
+- **GPU has fixed startup cost** (~1s for OPTIX kernel JIT + BVH upload). At 16 spp 512² OPTIX is *slower* than CPU; use CPU for the HITL loop and GPU only when the render itself takes more than that fixed cost. `--device AUTO` codifies this rule.
 - **`Material.use_nodes = True` is deprecated** in 5.1+ but still required to ensure the Principled BSDF node exists. `bh.principled()` suppresses the warning.
-- **Pure-headless rendering on systems without a display server** can break EEVEE/Workbench because they need OpenGL. Always use CYCLES + CPU there. The runtime defaults to this.
+- **EEVEE / Workbench need OpenGL** and break on pure-headless boxes without a display server. CYCLES is fine — both CPU and GPU backends (CUDA/OPTIX/HIP/METAL/ONEAPI) are pure compute and work without a display.
 
 See `docs/PITFALLS.md` for more.
 

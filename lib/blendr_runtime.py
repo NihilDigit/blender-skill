@@ -12,6 +12,8 @@ Env vars set by the blendr CLI wrapper:
   BLENDR_PREVIEW    "auto" | "skip" | "sheet" | "turntable"
   BLENDR_SAMPLES    cycles samples (default 16)
   BLENDR_RES        "WxH" preview resolution (default 512x512)
+  BLENDR_DEVICE     "CPU" | "OPTIX" | "CUDA" | "HIP" | "METAL" | "ONEAPI"
+                    (default "CPU"; GPU backends require matching hardware)
 """
 import os
 import sys
@@ -29,16 +31,92 @@ class _State:
     skip_preview = False
     skip_save = False
     user_rendered = False
+    device = os.environ.get("BLENDR_DEVICE", "CPU").upper()
+    # Set by configure_preview_engine to record what actually got picked.
+    # One of: "CPU" or "GPU:<BACKEND>:<device-name>".
+    resolved_device = "CPU"
 
 
 state = _State()
 
 
+_GPU_BACKENDS = ("OPTIX", "CUDA", "HIP", "METAL", "ONEAPI")
+# AUTO heuristic: switch to GPU once the render is heavy enough to amortize
+# kernel JIT + BVH upload (~1s on RTX-class hardware).
+_AUTO_HEAVY_SAMPLES = 64
+_AUTO_HEAVY_PIXELS = 512 * 512
+
+
+def _enable_cycles_devices(backend):
+    """Activate the requested GPU backend in Cycles addon prefs.
+
+    Returns list of (type, name) tuples that ended up enabled, or [] if the
+    backend has no devices on this machine.
+    """
+    if backend == "CPU":
+        return []
+    prefs = bpy.context.preferences.addons["cycles"].preferences
+    prefs.compute_device_type = backend
+    prefs.refresh_devices()
+    enabled = []
+    for d in prefs.devices:
+        if d.type == backend:
+            d.use = True
+            enabled.append((d.type, d.name))
+        elif d.type == "CPU":
+            d.use = False
+    return enabled
+
+
+def _pick_auto_backend():
+    """Pick the best available GPU backend, in priority order. None if no GPU."""
+    prefs = bpy.context.preferences.addons["cycles"].preferences
+    for backend in _GPU_BACKENDS:
+        try:
+            prefs.compute_device_type = backend
+        except TypeError:
+            continue  # backend unsupported on this build
+        prefs.refresh_devices()
+        if any(d.type == backend for d in prefs.devices):
+            return backend
+    return None
+
+
 def configure_preview_engine(scene=None):
-    """Apply CYCLES+CPU defaults. Idempotent — user scripts may override."""
+    """Apply CYCLES defaults. Device honors BLENDR_DEVICE (default CPU).
+
+    BLENDR_DEVICE values:
+      CPU        force CPU (default)
+      OPTIX/CUDA/HIP/METAL/ONEAPI  force that backend; warn + fall back to CPU
+                                   if no matching device is present
+      AUTO       use GPU only when render is heavy (samples>=64 or
+                 resolution>512^2), otherwise CPU. Picks first available
+                 backend in order: OPTIX, CUDA, HIP, METAL, ONEAPI.
+    """
     scene = scene or bpy.context.scene
     scene.render.engine = "CYCLES"
-    scene.cycles.device = "CPU"
+    backend = state.device
+
+    if backend == "AUTO":
+        pixels = state.res_w * state.res_h
+        heavy = state.samples >= _AUTO_HEAVY_SAMPLES or pixels > _AUTO_HEAVY_PIXELS
+        backend = _pick_auto_backend() if heavy else None
+        if backend is None:
+            backend = "CPU"
+
+    if backend in _GPU_BACKENDS:
+        enabled = _enable_cycles_devices(backend)
+        if enabled:
+            scene.cycles.device = "GPU"
+            state.resolved_device = f"GPU:{backend}:{enabled[0][1]}"
+        else:
+            print(f"[blendr] WARN: no {backend} devices found, falling back to CPU")
+            scene.cycles.device = "CPU"
+            state.resolved_device = "CPU"
+    else:
+        scene.cycles.device = "CPU"
+        state.resolved_device = "CPU"
+
     scene.cycles.samples = state.samples
     scene.render.resolution_x = state.res_w
     scene.render.resolution_y = state.res_h
@@ -111,6 +189,7 @@ def _scene_summary():
         "polys": polys,
         "user_engine": scene.render.engine,
         "preview_engine": "CYCLES (forced)",
+        "device": state.resolved_device,
         "camera": scene.camera.name if scene.camera else None,
     }
 
